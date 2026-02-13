@@ -1,0 +1,557 @@
+fastapi
+uvicorn
+celery
+redis
+python-dotenv
+python-multipart
+aiofiles
+openai-whisper
+torch
+torchaudio
+numpy
+opencv-python-headless
+pillow
+ffmpeg-python
+openai               # NEW - For GPT title generation
+elevenlabs           # NEW - For premium voiceovers
+boto3                # NEW - For AWS Polly (backup TTS)
+import openai
+import os
+from typing import List, Dict
+
+class TitleGenerator:
+    def __init__(self, api_key=None):
+        """Initialize with OpenAI API key"""
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        openai.api_key = self.api_key
+    
+    def generate_titles(self, transcript_snippet: str, clip_duration: float, ai_score: float, n=3) -> List[Dict]:
+        """
+        Generate click-worthy titles from transcript snippet
+        Returns list of titles with scores
+        """
+        prompt = f"""
+        You are a professional video title writer for YouTube, TikTok, and Instagram.
+        
+        Based on this transcript snippet from a video clip, generate {n} engaging, click-worthy titles.
+        
+        Transcript: "{transcript_snippet}"
+        Clip duration: {clip_duration:.0f} seconds
+        AI quality score: {ai_score}/100
+        
+        Rules:
+        - Titles should be 40-60 characters
+        - Use power words (amazing, incredible, secret, proven, etc.)
+        - Include numbers if relevant
+        - Create curiosity gaps
+        - Match the tone of the content
+        - Optimize for different platforms:
+          * YouTube: SEO-friendly, descriptive
+          * TikTok: Trendy, punchy
+          * Instagram: Aesthetic, engaging
+        
+        Return as JSON array with title, platform_focus, and predicted_ctr (0-100).
+        """
+        
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are an expert video title writer. Return only valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.8,
+                max_tokens=500
+            )
+            
+            import json
+            titles = json.loads(response.choices[0].message.content)
+            return titles
+            
+        except Exception as e:
+            # Fallback titles
+            return [
+                {"title": f"Amazing Clip (Score: {ai_score})", "platform_focus": "general", "predicted_ctr": 50},
+                {"title": "You Won't Believe This", "platform_focus": "tiktok", "predicted_ctr": 45},
+                {"title": "Secret Revealed 🔥", "platform_focus": "instagram", "predicted_ctr": 40}
+            ]
+    
+    def generate_description(self, transcript_snippet: str, title: str, tags=None) -> str:
+        """Generate SEO-optimized video description"""
+        prompt = f"""
+        Write a compelling YouTube video description for a clip titled: "{title}"
+        
+        Based on this transcript: "{transcript_snippet}"
+        
+        Include:
+        - Engaging first sentence
+        - 2-3 paragraph breakdown
+        - Relevant hashtags (5-10)
+        - Call to action
+        
+        Return as plain text.
+        """
+        
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are an expert video description writer."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7,
+                max_tokens=300
+            )
+            
+            return response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            return f"Check out this amazing clip! {transcript_snippet[:100]}... #viral #trending"
+    
+    def generate_hashtags(self, transcript_snippet: str, n=10) -> List[str]:
+        """Generate relevant hashtags from content"""
+        prompt = f"""
+        Generate {n} relevant hashtags for social media based on this content:
+        
+        "{transcript_snippet}"
+        
+        Return as comma-separated list.
+        """
+        
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a social media hashtag expert."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.6,
+                max_tokens=150
+            )
+            
+            tags = response.choices[0].message.content.strip().split(',')
+            return [tag.strip() for tag in tags if tag.strip()]
+            
+        except Exception as e:
+            return ["#viral", "#trending", "#fyp", "#video", "#clip", "#amazing", "#mustwatch", "#shorts", "#reels", "#tiktok"]
+import os
+import subprocess
+from pathlib import Path
+import requests
+import json
+from elevenlabs import generate, play, set_api_key, Voice, VoiceSettings
+
+class VoiceoverGenerator:
+    def __init__(self):
+        """Initialize TTS services"""
+        self.elevenlabs_key = os.getenv("ELEVENLABS_API_KEY")
+        self.openai_key = os.getenv("OPENAI_API_KEY")
+        
+        if self.elevenlabs_key:
+            set_api_key(self.elevenlabs_key)
+    
+    def generate_voiceover_script(self, transcript_snippet: str, style: str = "energetic") -> str:
+        """
+        Generate a voiceover script from transcript
+        style: "energetic", "professional", "calm", "dramatic"
+        """
+        
+        style_prompts = {
+            "energetic": "Write an energetic, exciting voiceover script that builds enthusiasm.",
+            "professional": "Write a professional, authoritative voiceover script for educational content.",
+            "calm": "Write a calm, soothing voiceover script for relaxing content.",
+            "dramatic": "Write a dramatic, suspenseful voiceover script with impact."
+        }
+        
+        prompt = f"""
+        {style_prompts.get(style, style_prompts["energetic"])}
+        
+        Based on this transcript from a video clip, create a 30-60 second voiceover script.
+        Make it engaging and natural for spoken delivery.
+        
+        Original content: "{transcript_snippet}"
+        
+        Return only the script text, no explanations.
+        """
+        
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a professional voiceover script writer."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.8,
+                max_tokens=300
+            )
+            
+            return response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            # Fallback - use original transcript
+            return transcript_snippet
+    
+    def generate_voiceover_elevenlabs(self, text: str, voice_id: str = "21m00Tcm4TlvDq8ikWAM", output_path: str) -> bool:
+        """
+        Generate voiceover using ElevenLabs (premium, most natural)
+        Default voice: Rachel (21m00Tcm4TlvDq8ikWAM)
+        """
+        try:
+            audio = generate(
+                text=text,
+                voice=voice_id,
+                model="eleven_monolingual_v1"
+            )
+            
+            # Save audio file
+            with open(output_path, "wb") as f:
+                f.write(audio)
+            
+            return True
+            
+        except Exception as e:
+            print(f"ElevenLabs failed: {e}")
+            return False
+    
+    def generate_voiceover_openai(self, text: str, voice: str = "nova", output_path: str) -> bool:
+        """
+        Generate voiceover using OpenAI TTS
+        Voices: alloy, echo, fable, onyx, nova, shimmer
+        """
+        try:
+            response = openai.audio.speech.create(
+                model="tts-1",
+                voice=voice,
+                input=text
+            )
+            
+            response.stream_to_file(output_path)
+            return True
+            
+        except Exception as e:
+            print(f"OpenAI TTS failed: {e}")
+            return False
+    
+    def add_voiceover_to_video(self, video_path: str, audio_path: str, output_path: str, 
+                               original_volume: float = 0.3, voiceover_volume: float = 1.0) -> bool:
+        """
+        Merge voiceover with original video using FFmpeg
+        - Lowers original audio volume
+        - Adds voiceover on top
+        """
+        try:
+            # Create temp file for mixed audio
+            temp_audio = output_path.replace('.mp4', '_temp_audio.mp3')
+            
+            # Mix original audio (lowered) with voiceover
+            cmd_mix = [
+                'ffmpeg', '-i', video_path, '-i', audio_path,
+                '-filter_complex',
+                f'[0:a]volume={original_volume}[orig];[1:a]volume={voiceover_volume}[vo];[orig][vo]amix=inputs=2:duration=longest',
+                '-y', temp_audio
+            ]
+            subprocess.run(cmd_mix, check=True, capture_output=True)
+            
+            # Add mixed audio to video (no original audio)
+            cmd_final = [
+                'ffmpeg', '-i', video_path, '-i', temp_audio,
+                '-c:v', 'copy', '-c:a', 'aac',
+                '-map', '0:v:0', '-map', '1:a:0',
+                '-shortest', '-y', output_path
+            ]
+            subprocess.run(cmd_final, check=True, capture_output=True)
+            
+            # Cleanup
+            os.remove(temp_audio)
+            
+            return True
+            
+        except subprocess.CalledProcessError as e:
+            print(f"FFmpeg error: {e.stderr.decode()}")
+            return False
+    
+    def generate_complete_voiceover(self, video_path: str, transcript_snippet: str, 
+                                     style: str = "energetic", voice_type: str = "elevenlabs") -> Dict:
+        """
+        Complete pipeline: script -> audio -> merge
+        Returns info about generated voiceover
+        """
+        
+        # Step 1: Generate script
+        script = self.generate_voiceover_script(transcript_snippet, style)
+        
+        # Step 2: Generate audio
+        audio_path = video_path.replace('.mp4', '_voiceover.mp3')
+        
+        success = False
+        if voice_type == "elevenlabs" and self.elevenlabs_key:
+            success = self.generate_voiceover_elevenlabs(script, output_path=audio_path)
+        
+        if not success and self.openai_key:
+            success = self.generate_voiceover_openai(script, output_path=audio_path)
+        
+        if not success:
+            return {"success": False, "error": "No TTS service available"}
+        
+        # Step 3: Merge with video
+        output_path = video_path.replace('.mp4', '_with_voiceover.mp4')
+        merge_success = self.add_voiceover_to_video(video_path, audio_path, output_path)
+        
+        if merge_success:
+            return {
+                "success": True,
+                "script": script,
+                "audio_path": audio_path,
+                "video_path": output_path,
+                "style": style
+            }
+        else:
+            return {"success": False, "error": "Failed to merge audio"}
+from app.celery_app import celery
+from app.tasks.whisper_processor import WhisperProcessor
+from app.tasks.thumbnail_generator import ThumbnailGenerator
+from app.tasks.clip_processor import ClipProcessor
+from app.tasks.title_generator import TitleGenerator
+from app.tasks.voiceover_generator import VoiceoverGenerator
+import os
+import json
+
+# Initialize processors
+whisper = WhisperProcessor(model_size="base")
+thumbnail_gen = ThumbnailGenerator()
+clip_processor = ClipProcessor(output_dir="./clips")
+title_gen = TitleGenerator()
+voiceover_gen = VoiceoverGenerator()
+
+@celery.task(bind=True)
+def process_video(self, video_path: str):
+    """Complete pipeline: AI analysis + thumbnails + clips + titles + voiceover"""
+    
+    try:
+        video_id = os.path.basename(video_path).split('.')[0]
+        
+        # === STAGE 1: WHISPER ANALYSIS ===
+        self.update_state(state='PROCESSING', meta={'stage': 'analyzing with Whisper AI'})
+        
+        highlights = whisper.extract_highlights(
+            video_path, 
+            min_duration=60,
+            max_duration=120
+        )
+        
+        # === STAGE 2: CAPTIONS ===
+        self.update_state(state='PROCESSING', meta={'stage': 'generating captions'})
+        
+        captions_dir = "./captions"
+        os.makedirs(captions_dir, exist_ok=True)
+        srt_path = os.path.join(captions_dir, f"{video_id}.srt")
+        whisper.generate_srt(video_path, srt_path)
+        
+        # === STAGE 3: THUMBNAILS ===
+        self.update_state(state='PROCESSING', meta={'stage': 'generating thumbnails'})
+        
+        thumbnails_dir = f"./thumbnails/{video_id}"
+        clip_thumbnails = thumbnail_gen.generate_clip_thumbnails(
+            video_path, 
+            highlights, 
+            thumbnails_dir
+        )
+        
+        # === STAGE 4: EXTRACT VIDEO CLIPS ===
+        self.update_state(state='PROCESSING', meta={'stage': 'extracting video clips'})
+        
+        clip_data = []
+        for i, highlight in enumerate(highlights):
+            clip_data.append({
+                'id': i + 1,
+                'start_time': highlight['start'],
+                'end_time': highlight['end'],
+                'text_snippet': highlight['text'],
+                'ai_score': highlight['score']
+            })
+        
+        clip_results = clip_processor.extract_multiple_clips(
+            video_path,
+            clip_data,
+            video_id
+        )
+        
+        # === STAGE 5: GENERATE AI TITLES (NEW) ===
+        self.update_state(state='PROCESSING', meta={'stage': 'generating AI titles'})
+        
+        clip_titles = []
+        for i, (highlight, clip_file) in enumerate(zip(highlights, clip_results)):
+            if clip_file['success']:
+                titles = title_gen.generate_titles(
+                    highlight['text'][:300],  # First 300 chars
+                    clip_file['duration'],
+                    highlight['score'],
+                    n=3
+                )
+                
+                description = title_gen.generate_description(
+                    highlight['text'][:500],
+                    titles[0]['title'] if titles else f"Clip {i+1}"
+                )
+                
+                hashtags = title_gen.generate_hashtags(highlight['text'][:300])
+                
+                clip_titles.append({
+                    'clip_id': i + 1,
+                    'titles': titles,
+                    'best_title': titles[0]['title'] if titles else f"Clip {i+1}",
+                    'description': description,
+                    'hashtags': hashtags
+                })
+        
+        # === STAGE 6: GENERATE VOICEOVERS (NEW - OPTIONAL) ===
+        self.update_state(state='PROCESSING', meta={'stage': 'generating voiceovers (optional)'})
+        
+        # Note: Voiceovers are CPU-intensive and use API credits
+        # We'll generate for top 3 clips only by default
+        voiceover_results = []
+        for i, (clip_file, title_data) in enumerate(zip(clip_results[:3], clip_titles[:3])):
+            if clip_file['success'] and i < 3:  # Only top 3 clips
+                voiceover = voiceover_gen.generate_complete_voiceover(
+                    clip_file['path'],
+                    highlights[i]['text'],
+                    style="energetic" if highlights[i]['score'] > 70 else "professional"
+                )
+                
+                if voiceover['success']:
+                    voiceover_results.append({
+                        'clip_id': i + 1,
+                        'voiceover_video': voiceover['video_path'],
+                        'script': voiceover['script']
+                    })
+        
+        # === STAGE 7: COMBINE ALL DATA ===
+        self.update_state(state='PROCESSING', meta={'stage': 'finalizing results'})
+        
+        clips = []
+        for i, (highlight, thumb, clip_file, title_data) in enumerate(zip(
+            highlights, clip_thumbnails, clip_results, clip_titles
+        )):
+            if clip_file['success']:
+                clip_info = {
+                    "id": i + 1,
+                    "start_time": highlight["start"],
+                    "end_time": highlight["end"],
+                    "duration": clip_file['duration'],
+                    "ai_score": highlight["score"],
+                    "text_snippet": highlight["text"][:200] + "...",
+                    "titles": title_data['titles'],
+                    "best_title": title_data['best_title'],
+                    "description": title_data['description'],
+                    "hashtags": title_data['hashtags'],
+                    "thumbnail": {
+                        "path": thumb['path'],
+                        "web_path": thumb['web_path'],
+                        "time": thumb['time'],
+                        "has_faces": thumb['has_faces']
+                    },
+                    "video_file": {
+                        "path": clip_file['path'],
+                        "web_path": clip_file['web_path'],
+                        "size": os.path.getsize(clip_file['path']) if os.path.exists(clip_file['path']) else 0
+                    }
+                }
+                
+                # Add voiceover if available
+                for vo in voiceover_results:
+                    if vo['clip_id'] == i + 1:
+                        clip_info['voiceover'] = {
+                            'video_path': vo['voiceover_video'],
+                            'script': vo['script']
+                        }
+                
+                clips.append(clip_info)
+        
+        return {
+            "status": "completed",
+            "video_id": video_id,
+            "video_path": video_path,
+            "captions_file": srt_path,
+            "thumbnails_dir": thumbnails_dir,
+            "clips_dir": f"./clips/{video_id}",
+            "clips": clips,
+            "total_clips": len(clips),
+            "stats": {
+                "total_duration": sum(c['duration'] for c in clips),
+                "avg_score": sum(c['ai_score'] for c in clips) / len(clips) if clips else 0,
+                "has_faces": any(c['thumbnail']['has_faces'] for c in clips)
+            },
+            "message": f"✅ Complete! Generated {len(clips)} clips with AI titles + voiceovers"
+        }
+        
+    except Exception as e:
+        import traceback
+        return {
+            "status": "failed",
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "message": f"❌ Processing failed: {str(e)}"
+        }
+# API Keys for AI features
+OPENAI_API_KEY=your_openai_api_key_here
+ELEVENLABS_API_KEY=your_elevenlabs_api_key_here
+
+# Redis configuration
+CELERY_BROKER_URL=redis://redis:6379/0
+CELERY_RESULT_BACKEND=redis://redis:6379/0
+// Inside ClipCard component, add title selector
+const [selectedTitle, setSelectedTitle] = useState(clip.titles?.[0]?.title || clip.best_title);
+
+// In the UI, above the description:
+{clip.titles && clip.titles.length > 0 && (
+  <div className="mb-3">
+    <label className="text-xs text-gray-500 mb-1 block">AI Titles (click to select)</label>
+    <div className="flex flex-wrap gap-2">
+      {clip.titles.map((t, idx) => (
+        <button
+          key={idx}
+          onClick={() => setSelectedTitle(t.title)}
+          className={`text-xs px-2 py-1 rounded-full transition-colors ${
+            selectedTitle === t.title 
+              ? 'bg-primary text-white' 
+              : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+          }`}
+        >
+          {t.title} {t.predicted_ctr && <span className="ml-1 opacity-75">🔥{t.predicted_ctr}%</span>}
+        </button>
+      ))}
+    </div>
+  </div>
+)}
+
+{clip.description && (
+  <div className="mb-3 text-sm text-gray-600">
+    <label className="text-xs text-gray-500 block mb-1">Description</label>
+    <p className="line-clamp-2">{clip.description}</p>
+  </div>
+)}
+
+{clip.hashtags && clip.hashtags.length > 0 && (
+  <div className="mb-3">
+    <div className="flex flex-wrap gap-1">
+      {clip.hashtags.slice(0, 5).map((tag, idx) => (
+        <span key={idx} className="text-xs bg-blue-50 text-blue-600 px-2 py-1 rounded">
+          {tag}
+        </span>
+      ))}
+    </div>
+  </div>
+)}
+
+{clip.voiceover && (
+  <div className="mt-3 p-2 bg-purple-50 rounded-lg">
+    <span className="text-xs font-medium text-purple-700">🎙️ Voiceover available</span>
+    <a
+      href={`http://localhost:8000/${clip.voiceover.video_path}`}
+      download
+      className="block mt-1 text-sm text-purple-600 hover:text-purple-800"
+    >
+      Download with voiceover
+    </a>
+  </div>
+)}

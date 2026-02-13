@@ -1,0 +1,328 @@
+fastapi
+uvicorn
+celery
+redis
+python-dotenv
+python-multipart
+aiofiles
+openai-whisper
+torch
+torchaudio
+numpy
+opencv-python-headless  # NEW - OpenCV for thumbnails
+pillow                  # NEW - Image processing
+import cv2
+import os
+import numpy as np
+from PIL import Image
+import io
+
+class ThumbnailGenerator:
+    def __init__(self):
+        # Load face detection classifier
+        self.face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        )
+    
+    def extract_frames(self, video_path, num_frames=10):
+        """Extract key frames from video"""
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        frames = []
+        
+        # Sample evenly across video
+        for i in range(num_frames):
+            frame_pos = int((i / num_frames) * total_frames)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
+            ret, frame = cap.read()
+            if ret:
+                frames.append({
+                    'frame': frame,
+                    'position': frame_pos,
+                    'time': frame_pos / cap.get(cv2.CAP_PROP_FPS)
+                })
+        
+        cap.release()
+        return frames
+    
+    def detect_faces(self, frame):
+        """Detect faces in frame and return face regions"""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = self.face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(30, 30)
+        )
+        return faces
+    
+    def score_frame(self, frame, target_time=None):
+        """
+        Score frame based on:
+        - Presence of faces (high score)
+        - Sharpness/clarity
+        - Composition (rule of thirds)
+        - Proximity to target time (if specified)
+        """
+        score = 0
+        h, w = frame.shape[:2]
+        
+        # Face detection (highest priority)
+        faces = self.detect_faces(frame)
+        if len(faces) > 0:
+            score += 50
+            # Bonus for larger faces
+            for (x, y, fw, fh) in faces:
+                face_size = (fw * fh) / (w * h)
+                score += face_size * 30
+        
+        # Sharpness (Laplacian variance)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+        # Normalize sharpness (0-20 range typically)
+        score += min(sharpness / 10, 20)
+        
+        # Color richness (avoid dark/bright washed out frames)
+        mean_brightness = np.mean(gray)
+        if 50 < mean_brightness < 200:  # Good exposure range
+            score += 10
+        
+        return score
+    
+    def generate_thumbnail(self, video_path, output_path, target_time=None):
+        """
+        Generate best thumbnail from video
+        If target_time specified, try to get frame near that time
+        """
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        
+        best_frame = None
+        best_score = -1
+        best_position = 0
+        
+        if target_time:
+            # Focus search near target time
+            target_frame = int(target_time * fps)
+            search_range = int(fps * 5)  # Search 5 seconds around target
+            
+            start_frame = max(0, target_frame - search_range)
+            end_frame = min(total_frames, target_frame + search_range)
+            
+            # Sample frames in this range
+            for frame_pos in range(start_frame, end_frame, int(fps / 2)):  # Every 0.5 seconds
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
+                ret, frame = cap.read()
+                if ret:
+                    score = self.score_frame(frame)
+                    if score > best_score:
+                        best_score = score
+                        best_frame = frame.copy()
+                        best_position = frame_pos
+        else:
+            # Search entire video
+            frames = self.extract_frames(video_path, num_frames=20)
+            for frame_data in frames:
+                score = self.score_frame(frame_data['frame'])
+                if score > best_score:
+                    best_score = score
+                    best_frame = frame_data['frame'].copy()
+                    best_position = frame_data['position']
+        
+        cap.release()
+        
+        if best_frame is not None:
+            # Add slight enhancement
+            best_frame = self.enhance_thumbnail(best_frame)
+            
+            # Save thumbnail
+            cv2.imwrite(output_path, best_frame)
+            
+            # Also create a smaller version for web
+            self.create_web_thumbnail(best_frame, output_path.replace('.jpg', '_web.jpg'))
+            
+            return {
+                'path': output_path,
+                'position': best_position,
+                'time': best_position / fps,
+                'score': best_score,
+                'has_faces': best_score > 50  # Rough indicator
+            }
+        
+        return None
+    
+    def enhance_thumbnail(self, frame):
+        """Apply slight enhancements for better visual appeal"""
+        # Slight contrast enhancement
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        l = clahe.apply(l)
+        enhanced = cv2.merge([l, a, b])
+        enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+        
+        return enhanced
+    
+    def create_web_thumbnail(self, frame, output_path, size=(640, 360)):
+        """Create smaller web-optimized version"""
+        resized = cv2.resize(frame, size)
+        cv2.imwrite(output_path, resized, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    
+    def generate_clip_thumbnails(self, video_path, clips, output_dir):
+        """
+        Generate thumbnails for all clips in one batch
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        
+        thumbnails = []
+        for i, clip in enumerate(clips):
+            # Target middle of clip for thumbnail
+            target_time = (clip['start_time'] + clip['end_time']) / 2
+            
+            thumb_path = os.path.join(output_dir, f"thumb_clip_{i+1}.jpg")
+            
+            result = self.generate_thumbnail(
+                video_path, 
+                thumb_path, 
+                target_time=target_time
+            )
+            
+            if result:
+                thumbnails.append({
+                    'clip_id': i + 1,
+                    'path': thumb_path,
+                    'web_path': thumb_path.replace('.jpg', '_web.jpg'),
+                    'time': result['time'],
+                    'has_faces': result['has_faces']
+                })
+        
+        return thumbnails
+from app.celery_app import celery
+from app.tasks.whisper_processor import WhisperProcessor
+from app.tasks.thumbnail_generator import ThumbnailGenerator
+import os
+import json
+
+# Initialize processors
+whisper = WhisperProcessor(model_size="base")
+thumbnail_gen = ThumbnailGenerator()
+
+@celery.task(bind=True)
+def process_video(self, video_path: str):
+    """Process video with Whisper AI and generate thumbnails"""
+    
+    try:
+        # Update status
+        self.update_state(state='PROCESSING', meta={'stage': 'transcribing with Whisper'})
+        
+        # Step 1: Get transcription and highlights
+        highlights = whisper.extract_highlights(
+            video_path, 
+            min_duration=60,
+            max_duration=120
+        )
+        
+        self.update_state(state='PROCESSING', meta={'stage': 'generating captions'})
+        
+        # Step 2: Generate SRT file
+        video_id = os.path.basename(video_path).split('.')[0]
+        captions_dir = "./captions"
+        os.makedirs(captions_dir, exist_ok=True)
+        
+        srt_path = os.path.join(captions_dir, f"{video_id}.srt")
+        whisper.generate_srt(video_path, srt_path)
+        
+        self.update_state(state='PROCESSING', meta={'stage': 'generating thumbnails'})
+        
+        # Step 3: Generate thumbnails for each highlight
+        thumbnails_dir = f"./thumbnails/{video_id}"
+        clip_thumbnails = thumbnail_gen.generate_clip_thumbnails(
+            video_path, 
+            highlights, 
+            thumbnails_dir
+        )
+        
+        self.update_state(state='PROCESSING', meta={'stage': 'analyzing highlights'})
+        
+        # Step 4: Prepare clip data with thumbnails
+        clips = []
+        for i, (highlight, thumb) in enumerate(zip(highlights, clip_thumbnails)):
+            clip_data = {
+                "id": i + 1,
+                "start_time": highlight["start"],
+                "end_time": highlight["end"],
+                "duration": highlight["duration"],
+                "ai_score": highlight["score"],
+                "text_snippet": highlight["text"][:200] + "...",
+                "thumbnail": {
+                    "path": thumb['path'],
+                    "web_path": thumb['web_path'],
+                    "time": thumb['time'],
+                    "has_faces": thumb['has_faces']
+                }
+            }
+            clips.append(clip_data)
+        
+        # If no highlights found, create placeholder with thumbnail
+        if not clips:
+            # Generate thumbnail anyway
+            thumb_path = os.path.join(thumbnails_dir, "thumb_main.jpg")
+            thumb_result = thumbnail_gen.generate_thumbnail(video_path, thumb_path)
+            
+            clips = [{
+                "id": 1,
+                "start_time": 0,
+                "end_time": 60,
+                "duration": 60,
+                "ai_score": 50,
+                "text_snippet": "Automatic clip (no highlights detected)",
+                "thumbnail": {
+                    "path": thumb_path,
+                    "web_path": thumb_path.replace('.jpg', '_web.jpg'),
+                    "time": thumb_result['time'] if thumb_result else 0,
+                    "has_faces": thumb_result['has_faces'] if thumb_result else False
+                }
+            }]
+        
+        # Sort clips by AI score (highest first)
+        clips.sort(key=lambda x: x["ai_score"], reverse=True)
+        
+        return {
+            "status": "completed",
+            "video_id": video_id,
+            "video_path": video_path,
+            "captions_file": srt_path,
+            "thumbnails_dir": thumbnails_dir,
+            "clips": clips,
+            "total_clips": len(clips),
+            "message": f"Processing complete! Generated {len(clips)} clips with thumbnails"
+        }
+        
+    except Exception as e:
+        return {
+            "status": "failed",
+            "error": str(e),
+            "message": f"Processing failed: {str(e)}"
+        }
+version: '3'
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/uploads:/app/uploads
+      - ./backend/clips:/app/clips
+      - ./backend/thumbnails:/app/thumbnails
+      - ./backend/captions:/app/captions
+    depends_on:
+      - redis
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"

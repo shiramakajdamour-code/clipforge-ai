@@ -1,0 +1,113 @@
+fastapi
+uvicorn
+celery
+redis
+python-dotenv
+python-multipart  # NEW - for file uploads
+aiofiles         # NEW - async file handling
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+from app.tasks.worker import process_video
+import uuid
+import os
+import aiofiles
+from celery.result import AsyncResult
+
+app = FastAPI(title="ClipForge AI")
+
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.post("/api/upload")
+async def upload_video(file: UploadFile = File(...)):
+    # Validate file type
+    if not file.content_type.startswith("video/"):
+        raise HTTPException(400, "File must be a video")
+    
+    # Generate unique filename
+    file_id = str(uuid.uuid4())
+    file_ext = os.path.splitext(file.filename)[1]
+    file_path = os.path.join(UPLOAD_DIR, f"{file_id}{file_ext}")
+    
+    # Save file
+    async with aiofiles.open(file_path, 'wb') as f:
+        content = await file.read()
+        await f.write(content)
+    
+    # Start processing task
+    task = process_video.delay(file_path)
+    
+    return {
+        "file_id": file_id,
+        "filename": file.filename,
+        "task_id": task.id,
+        "status": "processing"
+    }
+
+@app.get("/api/status/{task_id}")
+def get_status(task_id: str):
+    task_result = AsyncResult(task_id)
+    
+    result = {
+        "task_id": task_id,
+        "status": task_result.status,
+        "result": task_result.result if task_result.ready() else None
+    }
+    
+    return JSONResponse(content=result)
+from app.celery_app import celery
+import time
+
+@celery.task(bind=True)
+def process_video(self, video_path: str):
+    """Process video to generate clips, thumbnails, and captions"""
+    
+    # Update task state
+    self.update_state(state='PROCESSING', meta={'stage': 'analyzing video'})
+    
+    # Simulate processing stages
+    time.sleep(2)  # Replace with actual video analysis
+    
+    self.update_state(state='PROCESSING', meta={'stage': 'detecting scenes'})
+    time.sleep(2)  # Replace with scene detection
+    
+    self.update_state(state='PROCESSING', meta={'stage': 'generating clips'})
+    time.sleep(2)  # Replace with clip extraction
+    
+    self.update_state(state='PROCESSING', meta={'stage': 'creating thumbnails'})
+    time.sleep(2)  # Replace with thumbnail generation
+    
+    self.update_state(state='PROCESSING', meta={'stage': 'adding captions'})
+    time.sleep(2)  # Replace with Whisper captions
+    
+    # Return results
+    return {
+        "status": "completed",
+        "video": video_path,
+        "clips": [
+            {"id": 1, "duration": 60, "start": 120},
+            {"id": 2, "duration": 45, "start": 300},
+            {"id": 3, "duration": 90, "start": 600}
+        ],
+        "thumbnails": ["thumb1.jpg", "thumb2.jpg", "thumb3.jpg"],
+        "message": "Processing completed successfully"
+    }
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/uploads:/app/uploads  # Add this line
+      - ./backend/clips:/app/clips
+      - ./backend/thumbnails:/app/thumbnails
+      - ./backend/captions:/app/captions
+    depends_on:
+      - redis
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0

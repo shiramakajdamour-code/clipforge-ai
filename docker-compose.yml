@@ -1,0 +1,35 @@
+version: '3'
+
+services:
+  fastapi:
+    image: tiangolo/uvicorn-gunicorn-fastapi:python3.8
+    volumes:
+      - ./app:/app
+    ports:
+      - '8000:80'
+    depends_on:
+      - redis
+
+  celery:
+    image: celery
+    command: celery -A app.tasks worker --loglevel=info
+    volumes:
+      - ./app:/app
+    depends_on:
+      - fastapi
+
+  redis:
+    image: redis:5.0.6
+    ports:
+      - '6379:6379'
+
+  nextjs:
+    image: node:14
+    volumes:
+      - ./nextjs:/app
+    working_dir: /app
+    ports:
+      - '3000:3000'
+    command: npm run dev
+    depends_on:
+      - fastapi

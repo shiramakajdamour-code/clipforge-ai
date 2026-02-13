@@ -1,0 +1,357 @@
+fastapi
+uvicorn
+celery
+redis
+python-dotenv
+python-multipart
+aiofiles
+openai-whisper
+torch
+torchaudio
+numpy
+opencv-python-headless
+pillow
+ffmpeg-python  # NEW - FFmpeg wrapper
+import ffmpeg
+import os
+import subprocess
+
+class ClipProcessor:
+    def __init__(self, output_dir="./clips"):
+        self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+    
+    def extract_clip(self, video_path, start_time, end_time, output_path, clip_id):
+        """
+        Extract a clip from video using FFmpeg
+        """
+        try:
+            # Calculate duration
+            duration = end_time - start_time
+            
+            # Ensure minimum 60 seconds
+            if duration < 60:
+                # Extend to 60 seconds if possible
+                end_time = start_time + 60
+                duration = 60
+            
+            # Format times for FFmpeg
+            start_str = self._format_time(start_time)
+            duration_str = self._format_time(duration)
+            
+            # Build FFmpeg command for high-quality clip
+            (
+                ffmpeg
+                .input(video_path, ss=start_str, t=duration_str)
+                .output(
+                    output_path,
+                    vcodec='libx264',
+                    acodec='aac',
+                    video_bitrate='2000k',
+                    audio_bitrate='128k',
+                    preset='fast',
+                    movflags='+faststart'  # Web optimization
+                )
+                .overwrite_output()
+                .run(capture_stdout=True, capture_stderr=True)
+            )
+            
+            # Also create a smaller version for web/preview
+            web_path = output_path.replace('.mp4', '_web.mp4')
+            self._create_web_version(output_path, web_path)
+            
+            return {
+                'success': True,
+                'path': output_path,
+                'web_path': web_path,
+                'duration': duration,
+                'start': start_time,
+                'end': end_time
+            }
+            
+        except ffmpeg.Error as e:
+            return {
+                'success': False,
+                'error': e.stderr.decode(),
+                'path': None
+            }
+    
+    def _format_time(self, seconds):
+        """Convert seconds to HH:MM:SS.mmm format"""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        seconds_remainder = seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{seconds_remainder:06.3f}"
+    
+    def _create_web_version(self, input_path, output_path, target_size='720x1280'):
+        """
+        Create mobile-optimized version for TikTok/Reels/Shorts
+        """
+        try:
+            # Create vertical version for mobile
+            (
+                ffmpeg
+                .input(input_path)
+                .filter('scale', 720, 1280, force_original_aspect_ratio='increase')
+                .filter('crop', 720, 1280)
+                .output(
+                    output_path,
+                    vcodec='libx264',
+                    acodec='aac',
+                    video_bitrate='1000k',
+                    preset='fast',
+                    movflags='+faststart'
+                )
+                .overwrite_output()
+                .run(capture_stdout=True, capture_stderr=True)
+            )
+            return True
+        except:
+            # Fallback to horizontal version
+            try:
+                (
+                    ffmpeg
+                    .input(input_path)
+                    .output(
+                        output_path,
+                        vcodec='libx264',
+                        acodec='aac',
+                        video_bitrate='1000k',
+                        preset='fast'
+                    )
+                    .overwrite_output()
+                    .run(capture_stdout=True, capture_stderr=True)
+                )
+                return True
+            except:
+                return False
+    
+    def extract_multiple_clips(self, video_path, clips, video_id):
+        """
+        Extract multiple clips from a video
+        clips: list of dict with start_time, end_time, id
+        """
+        output_dir = os.path.join(self.output_dir, video_id)
+        os.makedirs(output_dir, exist_ok=True)
+        
+        results = []
+        for clip in clips:
+            clip_id = clip['id']
+            output_path = os.path.join(output_dir, f"clip_{clip_id:03d}.mp4")
+            
+            result = self.extract_clip(
+                video_path,
+                clip['start_time'],
+                clip['end_time'],
+                output_path,
+                clip_id
+            )
+            
+            result['clip_id'] = clip_id
+            result['metadata'] = {
+                'title': f"Clip {clip_id}",
+                'description': clip.get('text_snippet', '')[:100],
+                'duration': result.get('duration', 0),
+                'score': clip.get('ai_score', 0)
+            }
+            
+            results.append(result)
+        
+        return results
+from app.celery_app import celery
+from app.tasks.whisper_processor import WhisperProcessor
+from app.tasks.thumbnail_generator import ThumbnailGenerator
+from app.tasks.clip_processor import ClipProcessor
+import os
+import json
+
+# Initialize processors
+whisper = WhisperProcessor(model_size="base")
+thumbnail_gen = ThumbnailGenerator()
+clip_processor = ClipProcessor(output_dir="./clips")
+
+@celery.task(bind=True)
+def process_video(self, video_path: str):
+    """Complete pipeline: AI analysis + thumbnails + actual video clips"""
+    
+    try:
+        video_id = os.path.basename(video_path).split('.')[0]
+        
+        # === STAGE 1: WHISPER ANALYSIS ===
+        self.update_state(state='PROCESSING', meta={'stage': 'analyzing with Whisper AI'})
+        
+        highlights = whisper.extract_highlights(
+            video_path, 
+            min_duration=60,
+            max_duration=120
+        )
+        
+        # === STAGE 2: CAPTIONS ===
+        self.update_state(state='PROCESSING', meta={'stage': 'generating captions'})
+        
+        captions_dir = "./captions"
+        os.makedirs(captions_dir, exist_ok=True)
+        srt_path = os.path.join(captions_dir, f"{video_id}.srt")
+        whisper.generate_srt(video_path, srt_path)
+        
+        # === STAGE 3: THUMBNAILS ===
+        self.update_state(state='PROCESSING', meta={'stage': 'generating thumbnails'})
+        
+        thumbnails_dir = f"./thumbnails/{video_id}"
+        clip_thumbnails = thumbnail_gen.generate_clip_thumbnails(
+            video_path, 
+            highlights, 
+            thumbnails_dir
+        )
+        
+        # === STAGE 4: ACTUAL VIDEO CLIPS (NEW) ===
+        self.update_state(state='PROCESSING', meta={'stage': 'extracting video clips with FFmpeg'})
+        
+        # Prepare clip data for extraction
+        clip_data = []
+        for i, highlight in enumerate(highlights):
+            clip_data.append({
+                'id': i + 1,
+                'start_time': highlight['start'],
+                'end_time': highlight['end'],
+                'text_snippet': highlight['text'],
+                'ai_score': highlight['score']
+            })
+        
+        # Extract actual video files
+        clip_results = clip_processor.extract_multiple_clips(
+            video_path,
+            clip_data,
+            video_id
+        )
+        
+        # === STAGE 5: COMBINE ALL DATA ===
+        self.update_state(state='PROCESSING', meta={'stage': 'finalizing results'})
+        
+        # Build final clips array with all assets
+        clips = []
+        for i, (highlight, thumb, clip_file) in enumerate(zip(highlights, clip_thumbnails, clip_results)):
+            if clip_file['success']:
+                clip_info = {
+                    "id": i + 1,
+                    "start_time": highlight["start"],
+                    "end_time": highlight["end"],
+                    "duration": clip_file['duration'],
+                    "ai_score": highlight["score"],
+                    "text_snippet": highlight["text"][:200] + "...",
+                    "thumbnail": {
+                        "path": thumb['path'],
+                        "web_path": thumb['web_path'],
+                        "time": thumb['time'],
+                        "has_faces": thumb['has_faces']
+                    },
+                    "video_file": {
+                        "path": clip_file['path'],
+                        "web_path": clip_file['web_path'],
+                        "size": os.path.getsize(clip_file['path']) if os.path.exists(clip_file['path']) else 0
+                    }
+                }
+                clips.append(clip_info)
+        
+        # If no clips, create one from full video
+        if not clips:
+            # Extract 60-second clip from start
+            fallback_clip = clip_processor.extract_clip(
+                video_path, 0, 60,
+                os.path.join(f"./clips/{video_id}", "clip_001.mp4"),
+                1
+            )
+            
+            if fallback_clip['success']:
+                thumb_path = os.path.join(thumbnails_dir, "thumb_main.jpg")
+                thumb_result = thumbnail_gen.generate_thumbnail(video_path, thumb_path)
+                
+                clips = [{
+                    "id": 1,
+                    "start_time": 0,
+                    "end_time": 60,
+                    "duration": 60,
+                    "ai_score": 50,
+                    "text_snippet": "Full video clip (60 seconds)",
+                    "thumbnail": {
+                        "path": thumb_path,
+                        "web_path": thumb_path.replace('.jpg', '_web.jpg'),
+                        "time": thumb_result['time'] if thumb_result else 0,
+                        "has_faces": thumb_result['has_faces'] if thumb_result else False
+                    },
+                    "video_file": {
+                        "path": fallback_clip['path'],
+                        "web_path": fallback_clip['web_path'],
+                        "size": os.path.getsize(fallback_clip['path'])
+                    }
+                }]
+        
+        # Sort by AI score
+        clips.sort(key=lambda x: x["ai_score"], reverse=True)
+        
+        return {
+            "status": "completed",
+            "video_id": video_id,
+            "video_path": video_path,
+            "captions_file": srt_path,
+            "thumbnails_dir": thumbnails_dir,
+            "clips_dir": f"./clips/{video_id}",
+            "clips": clips,
+            "total_clips": len(clips),
+            "stats": {
+                "total_duration": sum(c['duration'] for c in clips),
+                "avg_score": sum(c['ai_score'] for c in clips) / len(clips) if clips else 0,
+                "has_faces": any(c['thumbnail']['has_faces'] for c in clips)
+            },
+            "message": f"✅ Complete! Generated {len(clips)} video clips with thumbnails and captions"
+        }
+        
+    except Exception as e:
+        import traceback
+        return {
+            "status": "failed",
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "message": f"❌ Processing failed: {str(e)}"
+        }
+FROM python:3.11-slim
+
+# Install system dependencies including FFmpeg
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app ./app
+
+# Create directories for outputs
+RUN mkdir -p /app/uploads /app/clips /app/thumbnails /app/captions
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+version: '3'
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/uploads:/app/uploads
+      - ./backend/clips:/app/clips
+      - ./backend/thumbnails:/app/thumbnails
+      - ./backend/captions:/app/captions
+    depends_on:
+      - redis
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"

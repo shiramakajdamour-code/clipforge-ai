@@ -1,0 +1,19 @@
+fastapi
+uvicorn
+celery
+redis
+python-dotenv
+python-multipart
+aiofiles
+openai-whisper
+torch
+torchaudio
+numpy
+opencv-python-headless
+pillow
+ffmpeg-python
+openai
+elevenlabs
+boto3
+replicate              # NEW - For Stable Diffusion/Runway
+pillow                 # Already have

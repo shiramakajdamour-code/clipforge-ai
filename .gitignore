@@ -1,0 +1,5 @@
+# Sensitive credentials
+backend/client_secrets.json
+
+# Optional: ignore all JSON secrets (if you want)
+*.json
